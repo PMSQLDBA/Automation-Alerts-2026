@@ -1,0 +1,234 @@
+--T-SQL script for a SQL Agent job that monitors database states and sends HTML email alerts:
+
+What it covers:
+==============
+1) All non-ONLINE states: RESTORING, RECOVERING, RECOVERY PENDING, SUSPECT, EMERGENCY, OFFLINE, COPYING, OFFLINE SECONDARY
+2) Smart exit: skips the email entirely if all databases are online (no noise)
+3) Styled HTML email: color-coded state badges, server name, timestamp, and affected count
+4) Runs every 5 minutes via SQL Agent — adjust @freq_subday_interval as needed
+5) Safe re-run: uses CREATE OR ALTER and drops the job if it already exists
+
+==============================================================================================================================
+
+USE msdb;
+GO
+--Step 1: Create the Alert Stored Procedure
+USE master;
+GO
+CREATE OR ALTER PROCEDURE dbo.usp_MonitorDatabaseStates
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @html_body       NVARCHAR(MAX);
+    DECLARE @subject         NVARCHAR(500);
+    DECLARE @offline_count   INT;
+    DECLARE @profile_name    NVARCHAR(100) = 'DBAAlerts'; -- ⚠ Change this
+    DECLARE @recipient       NVARCHAR(500) = 'praveensqldba12@gmail.com';  -- ⚠ Change this
+
+    -- -----------------------------------------------
+    -- Collect databases NOT in ONLINE state
+    -- -----------------------------------------------
+    IF OBJECT_ID('tempdb..#OfflineDatabases') IS NOT NULL
+        DROP TABLE #OfflineDatabases;
+
+    SELECT
+        d.database_id,
+        d.name                                          AS DatabaseName,
+        d.state_desc                                    AS CurrentState,
+        d.recovery_model_desc                           AS RecoveryModel,
+        d.log_reuse_wait_desc                           AS LogReuseWait,
+        SUSER_SNAME(d.owner_sid)                        AS DBOwner,
+        d.create_date                                   AS CreateDate,
+        GETDATE()                                       AS CheckedAt,
+        CASE d.state
+            WHEN 0 THEN 'ONLINE'
+            WHEN 1 THEN 'RESTORING'
+            WHEN 2 THEN 'RECOVERING'
+            WHEN 3 THEN 'RECOVERY PENDING'
+            WHEN 4 THEN 'SUSPECT'
+            WHEN 5 THEN 'EMERGENCY'
+            WHEN 6 THEN 'OFFLINE'
+            WHEN 7 THEN 'COPYING (Azure)'
+            WHEN 10 THEN 'OFFLINE SECONDARY'
+            ELSE 'UNKNOWN (' + CAST(d.state AS VARCHAR) + ')'
+        END  AS StateDisplay
+    INTO #OfflineDatabases
+    FROM sys.databases d
+    WHERE d.state <> 0  -- Exclude ONLINE databases
+      AND d.name NOT IN ('tempdb'); -- Optionally exclude tempdb
+
+    SELECT @offline_count = COUNT(*) FROM #OfflineDatabases;
+
+    -- -----------------------------------------------
+    -- Exit early if all databases are online
+    -- -----------------------------------------------
+    IF @offline_count = 0
+    BEGIN
+        PRINT 'All databases are ONLINE. No alert sent.';
+        RETURN;
+    END
+
+    -- -----------------------------------------------
+    -- Build HTML Email Body
+    -- -----------------------------------------------
+    SET @subject = 'SQL ALERT: ' + CAST(@offline_count AS VARCHAR)
+                 + ' Database(s) Not ONLINE on [' + @@SERVERNAME + ']';
+
+    SET @html_body = N'
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8"/>
+  <style>
+    body        { font-family: Segoe UI, Arial, sans-serif; font-size: 14px; color: #222; background: #f4f6f9; margin: 0; padding: 20px; }
+    .container  { max-width: 900px; margin: auto; background: #fff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden; }
+    .header     { background: #c0392b; color: #fff; padding: 24px 30px; }
+    .header h2  { margin: 0 0 4px 0; font-size: 22px; }
+    .header p   { margin: 0; font-size: 13px; opacity: 0.85; }
+    .meta       { background: #fdf3f2; border-left: 4px solid #c0392b; padding: 14px 30px; font-size: 13px; color: #555; }
+    .meta span  { margin-right: 30px; }
+    .meta b     { color: #222; }
+    table       { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th          { background: #2c3e50; color: #fff; padding: 11px 14px; text-align: left; font-weight: 600; letter-spacing: 0.4px; }
+    td          { padding: 10px 14px; border-bottom: 1px solid #eee; vertical-align: top; }
+    tr:nth-child(even) td { background: #f9f9f9; }
+    tr:hover td { background: #fef9e7; }
+    .state-RESTORING        { color: #e67e22; font-weight: bold; }
+    .state-RECOVERING       { color: #f39c12; font-weight: bold; }
+    .state-RECOVERY_PENDING { color: #e67e22; font-weight: bold; }
+    .state-SUSPECT          { color: #c0392b; font-weight: bold; background: #fde8e8; padding: 3px 7px; border-radius: 4px; }
+    .state-EMERGENCY        { color: #fff; font-weight: bold; background: #c0392b; padding: 3px 7px; border-radius: 4px; }
+    .state-OFFLINE          { color: #fff; font-weight: bold; background: #7f8c8d; padding: 3px 7px; border-radius: 4px; }
+    .state-OTHER            { color: #8e44ad; font-weight: bold; }
+    .footer     { background: #f4f6f9; padding: 14px 30px; font-size: 11px; color: #888; text-align: center; border-top: 1px solid #ddd; }
+    .badge      { display: inline-block; background: #c0392b; color: #fff; border-radius: 50%; width: 22px; height: 22px;
+                  line-height: 22px; text-align: center; font-size: 12px; font-weight: bold; margin-right: 8px; }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <div class="header">
+    <h2>&#9888; Database Offline State Alert</h2>
+    <p>One or more databases are NOT in an ONLINE state and require immediate attention.</p>
+  </div>
+
+  <div class="meta">
+    <span><b>Server:</b> ' + @@SERVERNAME + N'</span>
+    <span><b>Detected:</b> ' + CONVERT(NVARCHAR, GETDATE(), 120) + N'</span>
+    <span><b>Affected DBs:</b> <span class="badge">' + CAST(@offline_count AS NVARCHAR) + N'</span></span>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Database Name</th>
+        <th>Current State</th>
+        <th>Recovery Model</th>
+        <th>Log Reuse Wait</th>
+        <th>Owner</th>
+        <th>Created</th>
+      </tr>
+    </thead>
+    <tbody>';
+
+    -- Build table rows dynamically
+    SELECT @html_body = @html_body + N'
+      <tr>
+        <td>' + CAST(ROW_NUMBER() OVER (ORDER BY CurrentState, DatabaseName) AS NVARCHAR) + N'</td>
+        <td><b>' + DatabaseName + N'</b></td>
+        <td><span class="state-' + REPLACE(CurrentState, ' ', '_') + N'">' + StateDisplay + N'</span></td>
+        <td>' + RecoveryModel + N'</td>
+        <td>' + LogReuseWait + N'</td>
+        <td>' + ISNULL(DBOwner, 'N/A') + N'</td>
+        <td>' + CONVERT(NVARCHAR, CreateDate, 23) + N'</td>
+      </tr>'
+    FROM #OfflineDatabases
+    ORDER BY CurrentState, DatabaseName;
+
+    SET @html_body = @html_body + N'
+    </tbody>
+  </table>
+
+  <div class="footer">
+    &#128274; This is an automated alert from SQL Server Agent on <b>' + @@SERVERNAME + N'</b>.
+    Please investigate immediately. &mdash; Generated at ' + CONVERT(NVARCHAR, GETDATE(), 120) + N'
+  </div>
+
+</div>
+</body>
+</html>';
+
+    -- -----------------------------------------------
+    -- Send the Email
+    -- -----------------------------------------------
+    EXEC msdb.dbo.sp_send_dbmail
+        @profile_name  = @profile_name,
+        @recipients    = @recipient,
+        @subject       = @subject,
+        @body          = @html_body,
+        @body_format   = 'HTML';
+
+    PRINT 'Alert email sent for ' + CAST(@offline_count AS VARCHAR) + ' database(s).';
+
+    DROP TABLE #OfflineDatabases;
+END;
+GO
+
+-- =============================================
+-- Step 2: Create the SQL Agent Job
+-- =============================================
+USE msdb;
+GO
+
+DECLARE @job_id    UNIQUEIDENTIFIER;
+DECLARE @job_name  NVARCHAR(100) = N'DBA - Monitor Database States';
+
+-- Remove existing job if it exists
+IF EXISTS (SELECT 1 FROM msdb.dbo.sysjobs WHERE name = @job_name)
+    EXEC msdb.dbo.sp_delete_job @job_name = @job_name;
+
+-- Create the job
+EXEC msdb.dbo.sp_add_job
+    @job_name              = @job_name,
+    @enabled               = 1,
+    @description           = N'Monitors all database states every 10 minutes and sends an HTML alert email if any DB is not ONLINE.',
+    @category_name         = N'Database Maintenance',
+    @owner_login_name      = N'sa',  -- ⚠ Change to appropriate login
+    @notify_level_eventlog = 2;      -- Log on failure
+
+-- Add the job step
+EXEC msdb.dbo.sp_add_jobstep
+    @job_name        = @job_name,
+    @step_name       = N'Check DB States and Send Alert',
+    @step_id         = 1,
+    @subsystem       = N'TSQL',
+    @command         = N'EXEC master.dbo.usp_MonitorDatabaseStates;',
+    @database_name   = N'master',
+    @on_success_action = 1,  -- Quit with success
+    @on_fail_action    = 2;  -- Quit with failure
+
+-- Schedule: every 10 minutes
+EXEC msdb.dbo.sp_add_schedule
+    @schedule_name      = N'Every 10 Minutes',
+    @freq_type          = 4,       -- Daily
+    @freq_interval      = 1,
+    @freq_subday_type   = 4,       -- Minutes
+    @freq_subday_interval = 10,    -- Every 10 minutes
+    @active_start_time  = 000000,  -- Midnight
+    @active_end_time    = 235959;  -- End of day
+
+-- Attach schedule to job
+EXEC msdb.dbo.sp_attach_schedule
+    @job_name      = @job_name,
+    @schedule_name = N'Every 10 Minutes';
+
+-- Assign to local server
+EXEC msdb.dbo.sp_add_jobserver
+    @job_name   = @job_name,
+    @server_name = N'(LOCAL)';
+
+PRINT 'SQL Agent Job created successfully: ' + @job_name;
+GO
